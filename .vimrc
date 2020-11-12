@@ -103,3 +103,11 @@ let g:syntastic_check_on_open = 1
 let g:syntastic_check_on_wq = 0
 let g:syntastic_python_checkers = ['pycodestyle']
 let g:syntastic_python3_checkers = ['pep8']
+
+""*****************************************************************************
+"" Keyboard
+"*****************************************************************************
+" TABキーを押した際にタブ文字の代わりにスペースを入れる
+set expandtab
+set tabstop=4
+set shiftwidth=4
