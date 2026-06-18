@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# motmux — tmux セッションマネージャ。
+#
+# tmux の内外で挙動が変わる（tmuximum 流）:
+#   tmux 外: attach-session でアタッチ
+#   tmux 内: switch-client で切替（display-popup のモーダルで表示）
+#
+# UI は fzf のプレビューに各セッションの画面内容（capture-pane）を出し、
+# 中身を見ながら切り替えられる（tmux-claude-session-manager 流）。
+#
+# 使い方:
+#   motmux                 セッション選択モーダルを開く（tmux 内ではポップアップ）
+#   motmux <session>       指定セッションへ 切替(tmux内)/アタッチ(tmux外)
+#   motmux -k <session>    セッション <session> を削除
+#   motmux -l              セッション一覧を出力（スクリプト用）
+#   motmux -h              ヘルプ
+#
+# 依存: tmux (>=3.2, display-popup), fzf
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SELF="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
+# ---- inlined from lib/common.sh ----
+# 共有ユーティリティ。各コマンドから `source` して使う。
+# このファイル自体は実行せず読み込み専用。
+
+
+# 標準エラーへログ出力（標準出力はコマンドの結果専用に空けておく）
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+# エラーメッセージを出して終了する
+die() {
+  local code="${2:-1}"
+  printf 'error: %s\n' "${1}" >&2
+  exit "${code}"
+}
+
+# 依存コマンドの存在を確認する
+require_cmd() {
+  local cmd
+  for cmd in "$@"; do
+    command -v "${cmd}" >/dev/null 2>&1 || die "required command not found: ${cmd}" 127
+  done
+}
+# ---- end lib/common.sh ----
+
+readonly PROMPT='motmux > '
+readonly HEADER='enter: 切替/アタッチ   ctrl-x: kill   ctrl-n: 新規   esc: 中止'
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: motmux [options] [session]
+  (引数なし)        セッション選択モーダルを開く（tmux 内ではポップアップ）
+  session           指定セッションへ 切替(tmux内)/アタッチ(tmux外)
+  -k, --kill NAME   セッション NAME を削除
+  -l, --list        セッション一覧を出力（名前 TAB 情報）
+  -h, --help        このヘルプ
+
+tmux 内では switch-client（display-popup モーダル）、tmux 外では attach-session。
+依存: tmux (>=3.2), fzf
+EOF
+}
+
+# tmux セッションの中にいるか
+in_tmux() {
+  [[ -n "${TMUX:-}" ]]
+}
+
+# セッション一覧を「名前 <TAB> 情報」形式で出力（fzf の入力に使う）
+list_sessions() {
+  local fmt
+  fmt=$'#{session_name}\t#{session_windows} windows#{?session_attached, [attached],}'
+  tmux list-sessions -F "${fmt}" 2>/dev/null || true
+}
+
+# セッションのアクティブウィンドウにある全ペインの中身を縦に並べて出力する。
+# capture-pane 単体ではアクティブペイン 1 枚しか取れず、分割中は片方しか映らないため、
+# list-panes で全ペインを列挙して個別に capture する（fzf の --preview から呼ばれる）。
+preview_session() {
+  local sess="${1:?session name required}"
+  tmux has-session -t "${sess}" 2>/dev/null || return 0
+
+  local panes
+  panes="$(tmux list-panes -t "${sess}" -F '#{pane_id}' 2>/dev/null)" || return 0
+
+  local first=1 pane info
+  while IFS= read -r pane; do
+    [[ -z "${pane}" ]] && continue
+    [[ "${first}" -eq 1 ]] || printf '\n'
+    first=0
+    info="$(tmux display-message -p -t "${pane}" \
+      '#{pane_index}: #{pane_current_command} (#{pane_width}x#{pane_height})' 2>/dev/null)" || info="${pane}"
+    printf '\033[7m── pane %s ──\033[0m\n' "${info}"
+    tmux capture-pane -ep -t "${pane}" 2>/dev/null || true
+  done <<<"${panes}"
+}
+
+# 指定セッションへ 切替/アタッチ（tmux 内外で挙動を変える）
+activate_session() {
+  local name="${1:?session name required}"
+  tmux has-session -t "${name}" 2>/dev/null || die "no such session: ${name}"
+  if in_tmux; then
+    tmux switch-client -t "${name}"
+  else
+    tmux attach-session -t "${name}"
+  fi
+}
+
+# セッションを削除する
+kill_session() {
+  local name="${1:?session name required}"
+  tmux has-session -t "${name}" 2>/dev/null || die "no such session: ${name}"
+  tmux kill-session -t "${name}"
+  log "killed session: ${name}"
+}
+
+# 新規セッションを対話入力で作って 切替/アタッチ
+create_session() {
+  local name
+  read -r -p "新しいセッション名 (空でキャンセル): " name || return 0
+  [[ -z "${name}" ]] && return 0
+  if in_tmux; then
+    tmux new-session -d -s "${name}"
+    tmux switch-client -t "${name}"
+  else
+    tmux new-session -s "${name}"
+  fi
+}
+
+# fzf でセッションを選んで操作する。
+# display-popup の中、または tmux 外なら端末上で直接動く。
+run_picker() {
+  require_cmd fzf
+  local list
+  list="$(list_sessions)"
+  if [[ -z "${list}" ]]; then
+    log "セッションがありません。新規作成します。"
+    create_session
+    return 0
+  fi
+
+  local out rc key sel name
+  set +e
+  out="$(
+    printf '%s\n' "${list}" | fzf \
+      --ansi \
+      --delimiter=$'\t' \
+      --with-nth=1,2 \
+      --prompt="${PROMPT}" \
+      --header="${HEADER}" \
+      --preview="${SELF} --preview {1}" \
+      --preview-window='right,60%,border-left,wrap' \
+      --bind="ctrl-x:execute-silent(tmux kill-session -t {1})+reload(${SELF} --list)" \
+      --expect=ctrl-n
+  )"
+  rc=$?
+  set -e
+
+  [[ ${rc} -eq 130 ]] && return 0 # esc / ctrl-c
+  [[ -z "${out}" ]] && return 0
+
+  key="$(printf '%s\n' "${out}" | sed -n '1p')"
+  sel="$(printf '%s\n' "${out}" | sed -n '2p')"
+
+  if [[ "${key}" == "ctrl-n" ]]; then
+    create_session
+    return 0
+  fi
+  [[ -z "${sel}" ]] && return 0
+  name="$(printf '%s' "${sel}" | cut -f1)"
+  activate_session "${name}"
+}
+
+main() {
+  require_cmd tmux
+
+  local kill_name=""
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      -h | --help)
+        usage
+        return 0
+        ;;
+      -l | --list)
+        list_sessions
+        return 0
+        ;;
+      --picker) # 内部用: display-popup から呼ばれる
+        run_picker
+        return 0
+        ;;
+      --preview) # 内部用: fzf の --preview から呼ばれる
+        [[ $# -ge 2 ]] || return 0
+        preview_session "${2}"
+        return 0
+        ;;
+      -k | --kill)
+        [[ $# -ge 2 ]] || die "--kill にはセッション名が必要です" 2
+        kill_name="${2}"
+        shift 2
+        continue
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        usage
+        return 2
+        ;;
+      *) break ;;
+    esac
+  done
+
+  if [[ -n "${kill_name}" ]]; then
+    kill_session "${kill_name}"
+    return 0
+  fi
+
+  # セッション名を直接指定: そのまま 切替/アタッチ
+  if [[ $# -ge 1 ]]; then
+    activate_session "${1}"
+    return 0
+  fi
+
+  # 引数なし: tmux 内ならポップアップ、外なら端末で直接ピッカー
+  if in_tmux; then
+    require_cmd fzf
+    tmux display-popup -E -w 80% -h 80% "${SELF} --picker"
+  else
+    run_picker
+  fi
+}
+
+main "$@"

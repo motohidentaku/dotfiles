@@ -54,6 +54,7 @@ install() {
   dotfiles=$HOME/dotfiles
 
   echo "Setting up Machine..."
+  echo "sudo $(determine_package_manager) install git tmux fzf"
 
   if is_exists "git"; then
     if [ -d "$dotfiles" ]; then
@@ -87,6 +88,8 @@ install() {
     echo "Not found git. Please"
     echo "sudo $(determine_package_manager) install git"
   fi
+
+  chmod +x "$dotfiles"/bin/motmux
 
 }
 
