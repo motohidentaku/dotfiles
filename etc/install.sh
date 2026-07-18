@@ -90,6 +90,7 @@ install() {
   fi
 
   chmod +x "$dotfiles"/bin/motmux
+  chmod +x "$dotfiles"/.claude/statusline-command.sh
 
 }
 
